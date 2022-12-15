@@ -22,7 +22,11 @@ def trades_loss(model,
                 epsilon=0.031,
                 perturb_steps=10,
                 beta=1.0,
-                distance='l_inf'):
+                distance='l_inf',
+                use_autocast=False):
+
+    scaler = torch.cuda.amp.GradScaler()
+
     # define KL-loss
     criterion_kl = nn.KLDivLoss(size_average=False)
     model.eval()
@@ -32,14 +36,27 @@ def trades_loss(model,
     if distance == 'l_inf':
         for _ in range(perturb_steps):
             x_adv.requires_grad_()
-            with torch.enable_grad():
-                loss_kl = criterion_kl(F.log_softmax(model(x_adv), dim=1),
-                                       F.softmax(model(x_natural), dim=1))
-            grad = torch.autograd.grad(loss_kl, [x_adv])[0]
+            if use_autocast:
+                with torch.cuda.amp.autocast():
+                    with torch.enable_grad():
+                        loss_kl = criterion_kl(F.log_softmax(model(x_adv), dim=1),
+                                            F.softmax(model(x_natural), dim=1))
+
+                grad = torch.autograd.grad(scaler.scale(loss_kl), [x_adv])[0]
+
+            else:
+                with torch.enable_grad():
+                    loss_kl = criterion_kl(F.log_softmax(model(x_adv), dim=1),
+                                        F.softmax(model(x_natural), dim=1))
+
+                grad = torch.autograd.grad(loss_kl, [x_adv])[0]
+    
             x_adv = x_adv.detach() + step_size * torch.sign(grad.detach())
             x_adv = torch.min(torch.max(x_adv, x_natural - epsilon), x_natural + epsilon)
             x_adv = torch.clamp(x_adv, 0.0, 1.0)
     elif distance == 'l_2':
+        raise NotImplementedError('mixed precision not implemented!')
+
         delta = 0.001 * torch.randn(x_natural.shape).cuda().detach()
         delta = Variable(delta.data, requires_grad=True)
 
@@ -74,11 +91,23 @@ def trades_loss(model,
 
     x_adv = Variable(torch.clamp(x_adv, 0.0, 1.0), requires_grad=False)
     # zero gradient
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     # calculate robust loss
-    logits = model(x_natural)
-    loss_natural = F.cross_entropy(logits, y)
-    loss_robust = (1.0 / batch_size) * criterion_kl(F.log_softmax(model(x_adv), dim=1),
-                                                    F.softmax(model(x_natural), dim=1))
-    loss = loss_natural + beta * loss_robust
+    if use_autocast:
+        with torch.cuda.amp.autocast():
+            logits = model(x_natural)
+        
+            loss_natural = F.cross_entropy(logits, y)
+            loss_robust = (1.0 / batch_size) * criterion_kl(F.log_softmax(model(x_adv), dim=1),
+                                                            F.softmax(model(x_natural), dim=1))
+            loss = loss_natural + beta * loss_robust
+            
+    else:
+        logits = model(x_natural)
+    
+        loss_natural = F.cross_entropy(logits, y)
+        loss_robust = (1.0 / batch_size) * criterion_kl(F.log_softmax(model(x_adv), dim=1),
+                                                        F.softmax(model(x_natural), dim=1))
+        loss = loss_natural + beta * loss_robust
+
     return loss
